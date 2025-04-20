@@ -14,7 +14,6 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 
-
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -26,6 +25,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        val availableHTTPCodesToRetry = setOf(429, 500, 502, 503, 504)
     }
 
     private val serviceName = properties.serviceName
@@ -34,10 +34,11 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-
-    private val semaphore = Semaphore(parallelRequests, true)
     private val client = OkHttpClient.Builder().build()
+
+    private val rt = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    private var semaphore = Semaphore(parallelRequests, true)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -45,7 +46,8 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-        // Вне зависимости от исхода оплаты важно отметить, что она была отправлена.
+        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
@@ -55,54 +57,42 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
-        // fail‑fast проверка ещё до того, как занимаем ресурсы очереди/лимитера
-        if (isOverDeadline(deadline)) {
-            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+        semaphore.acquire()
+
+        if (expireByDeadline(deadline)) {
+            logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough parallel requests")
             paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                it.logProcessing(
+                    success = false,
+                    now(),
+                    transactionId,
+                    reason = "Request would complete after deadline. No point in processing"
+                )
             }
+
+            semaphore.release()
+            return
+        }
+
+        rt.tickBlocking()
+
+        if (expireByDeadline(deadline)) {
+            logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough rps tokens")
+            paymentESService.update(paymentId) {
+                it.logProcessing(
+                    success = false,
+                    now(),
+                    transactionId,
+                    reason = "Request would complete after deadline. No point in processing"
+                )
+            }
+
+            semaphore.release()
             return
         }
 
         try {
-            semaphore.acquire() // возможно блокировка — сразу после неё проверяем дедлайн ещё раз
-
-            // NEW: проверка после ожидания семафора
-            if (isOverDeadline(deadline)) {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
-                }
-                return
-            }
-
-            rateLimiter.tickBlocking()
-
-            // NEW: финальная проверка после rate‑лимитера
-            if (isOverDeadline(deadline)) {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
-                }
-                return
-            }
-
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Обновляем состояние оплаты в любом исходе
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-            }
-
+            executeRequest(request, transactionId, paymentId, deadline)
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
@@ -126,13 +116,57 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun price() = properties.price
+
     override fun isEnabled() = properties.enabled
+
     override fun name() = properties.accountName
 
-    // NEW: вспомогательная функция для определения, успеваем ли мы с учётом средней длительности обработки
-    private fun isOverDeadline(deadline: Long): Boolean {
-        // «×3» — защитный коэффициент против случайных пиков;
-        return now() + requestAverageProcessingTime.toMillis() * 3 >= deadline
+    private fun expireByDeadline(deadline: Long): Boolean {
+        val expectedEnd = now() + requestAverageProcessingTime.toMillis() * 2
+
+        return expectedEnd >= deadline
+    }
+
+    private fun executeRequest(
+        request: Request,
+        transactionId: UUID,
+        paymentId: UUID,
+        deadline: Long,
+        times: Int = 0,
+        firstAttemptTime: Long = now()
+    ) {
+        times.inc()
+        if (times == 3) {
+            return
+        }
+
+        client.newCall(request).execute().use { response ->
+            if (response.code > 200) {
+                logger.error("response code ${response.code}")
+            }
+
+            val body = try {
+                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            if ((availableHTTPCodesToRetry.contains(response.code) || !body.result) && !expireByDeadline(deadline)) {
+                val delta = now() - firstAttemptTime
+                if (delta <= 1000) {
+                    Thread.sleep(1000 - delta)
+                }
+                executeRequest(request, transactionId, paymentId, deadline, times)
+            }
+
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            // Обновить состояние оплаты во всех исходах (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
+        }
     }
 }
 
