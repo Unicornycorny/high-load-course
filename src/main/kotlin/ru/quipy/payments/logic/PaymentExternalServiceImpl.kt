@@ -2,42 +2,31 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.ConnectionPool
-import okhttp3.Interceptor
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.Response
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.*
 import org.HdrHistogram.Histogram
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 private val internalLogger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-
 class AdaptiveTimeoutInterceptor(private val timeoutProvider: () -> Long) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val millis = timeoutProvider().toInt()
-        return chain
-            .withConnectTimeout(millis, TimeUnit.MILLISECONDS)
-            .withReadTimeout(millis, TimeUnit.MILLISECONDS)
-            .withWriteTimeout(millis, TimeUnit.MILLISECONDS)
+    override fun intercept(chain: Interceptor.Chain): Response =
+        chain
+            .withConnectTimeout(timeoutProvider().toInt(), TimeUnit.MILLISECONDS)
+            .withReadTimeout(timeoutProvider().toInt(), TimeUnit.MILLISECONDS)
+            .withWriteTimeout(timeoutProvider().toInt(), TimeUnit.MILLISECONDS)
             .proceed(chain.request())
-    }
 }
 
 class PaymentExternalSystemAdapterImpl(
@@ -50,43 +39,42 @@ class PaymentExternalSystemAdapterImpl(
         private val jsonMapper: ObjectMapper = ObjectMapper().registerKotlinModule()
     }
 
-    /* ---------------------------- inner DTO ---------------------------- */
-    private sealed class Outcome<out T> {
-        data class Success<out T>(val data: T) : Outcome<T>()
-        object Retry : Outcome<Nothing>()
-    }
-
+    /* ----------------- cfg shortcuts ----------------- */
     private val serviceLabel = cfg.serviceName
     private val merchantAccount = cfg.accountName
     private val avgLatency = cfg.averageProcessingTime
     private val maxRps = cfg.rateLimitPerSec
     private val parallelism = cfg.parallelRequests
-    private val retryAttempts = 3
+    private val retryAttempts = 2 // <= 1 повторная попытка + первичный вызов
 
-    /* ---------------------------- runtime metrics ---------------------------- */
-    private var percentile90: Duration = Duration.ofMillis(avgLatency.toMillis() * 5)
-    private var histMax = avgLatency.toMillis() * 8
+    /* ----------------- runtime metrics ----------------- */
+    private var p90: Duration = Duration.ofMillis(avgLatency.toMillis() * 5)
+    private val histMax = avgLatency.toMillis() * 8
     private val latencyHistogram = Histogram(avgLatency.toMillis(), histMax, 2)
 
-    /* ---------------------------- coroutine machinery ---------------------------- */
+    /* ----------------- coroutine machinery ------------- */
     @OptIn(ExperimentalCoroutinesApi::class)
     private val scope = CoroutineScope(Dispatchers.IO.limitedParallelism(parallelism) + SupervisorJob())
 
-    /* ---------------------------- http client ---------------------------- */
-    private val httpClient = OkHttpClient.Builder()
-        .connectionPool(ConnectionPool(18, 6, TimeUnit.MINUTES))
-        .addInterceptor(AdaptiveTimeoutInterceptor { percentile90.toMillis() })
+    /* ----------------- http client --------------------- */
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE)) // HTTP/2 без TLS (h2c)
+        .connectionPool(ConnectionPool(2, 5, TimeUnit.MINUTES))
+        .addInterceptor(AdaptiveTimeoutInterceptor { (p90.toMillis() * 0.9).toLong() })
         .build()
 
-    private val rateLimiter = TokenBucketRateLimiter(
+    /* ----------------- limiters ------------------------ */
+    private val rpsLimiter = TokenBucketRateLimiter(
         rate = maxRps,
         bucketMaxCapacity = maxRps,
-        window = avgLatency.toMillis(),
+        window = 1_000, // 1‑секундное окно в миллисекундах
         timeUnit = TimeUnit.MILLISECONDS,
     )
-    private val gate = Semaphore(parallelism)
+    // страховой запас 500 слотов, чтобы случайно не пробить лимит 20k
+    private val window = Semaphore((parallelism - 500).coerceAtLeast(1))
 
-    private val backoffBase = 200L
+    /* ----------------- back‑off params ----------------- */
+    private val backoffBase = 350L
     private val backoffCap = 1_000L
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, startedAt: Long, deadline: Long) {
@@ -101,40 +89,34 @@ class PaymentExternalSystemAdapterImpl(
             val requestUrl = buildString {
                 append("http://localhost:1234/external/process?")
                 append("serviceName=$serviceLabel&accountName=$merchantAccount&")
-                append("transactionId=$txId&paymentId=$paymentId&amount=$amount&$percentile90")
+                append("transactionId=$txId&paymentId=$paymentId&amount=$amount")
             }
             val httpRequest = Request.Builder().url(requestUrl).post(emptyBody).build()
 
-            val requestStart = System.currentTimeMillis()
-
+            val startTs = System.currentTimeMillis()
             try {
-                gate.acquire()
-
+                acquireSlot()
                 var attempt = 1
-                var completedSuccessfully = false
-
-                while (attempt <= retryAttempts && !completedSuccessfully && !outOfTime(deadline)) {
-                    rateLimiter.tick()
-
-                    val outcome = withTimeoutOrNull(percentile90.toMillis()) {
+                var done = false
+                while (attempt <= retryAttempts && !done && !outOfTime(deadline)) {
+                    rpsLimiter.tick()
+                    val outcome = withTimeoutOrNull(callTimeout(deadline)) {
                         dispatchCall(httpRequest, paymentId, txId)
                     }
-
                     when (outcome) {
                         is Outcome.Success -> {
-                            completedSuccessfully = outcome.data
-                            if (completedSuccessfully) break
+                            done = outcome.data
+                            if (done) break
                         }
                         is Outcome.Retry -> {
                             val d = backoffDelay(attempt, deadline)
                             if (d > 0) delay(d) else break
                         }
-                        null -> break // timeout reached
+                        null -> break // timeout
                     }
                     attempt++
                 }
-
-                if (!completedSuccessfully) {
+                if (!done) {
                     esService.update(paymentId) {
                         it.logProcessing(false, now(), txId, reason = "Max retries exceeded")
                     }
@@ -142,58 +124,65 @@ class PaymentExternalSystemAdapterImpl(
             } catch (ex: Exception) {
                 manageException(ex, paymentId, txId)
             } finally {
-                updateMetrics(requestStart)
-                gate.release()
+                releaseSlot()
+                updateMetrics(startTs)
             }
         }
+    }
+
+    /* ----------------- helpers ------------------------- */
+
+    private suspend fun acquireSlot() {
+        window.acquire()
+    }
+
+    private fun releaseSlot() = window.release()
+
+    private fun callTimeout(deadline: Long): Long =
+        (deadline - now() - 1_000).coerceAtLeast(1_000) // чуть меньше TTL
+
+    private fun outOfTime(deadline: Long): Boolean = now() > deadline - p90.toMillis()
+
+    private fun backoffDelay(attempt: Int, deadline: Long): Long {
+        val delay = (backoffBase * (1L shl (attempt - 1))).coerceAtMost(backoffCap)
+        return if (now() + delay < deadline) delay else -1
     }
 
     private suspend fun dispatchCall(req: Request, paymentId: UUID, txId: UUID): Outcome<Boolean> =
-        try {
-            httpClient.newCall(req).execute().use { resp ->
-                val body = try {
-                    jsonMapper.readValue(resp.body?.string(), ExternalSysResponse::class.java)
-                } catch (parseErr: Exception) {
-                    internalLogger.error("[$merchantAccount] invalid json for payment $paymentId", parseErr)
-                    return Outcome.Retry
-                }
-
-                esService.update(paymentId) {
-                    it.logProcessing(body.result, now(), txId, reason = body.message)
-                }
-
-                when {
-                    body.result -> Outcome.Success(true)
-                    resp.code == 429 -> {
-                        noteRateLimit(resp)
-                        Outcome.Retry
+        suspendCancellableCoroutine { cont ->
+            httpClient.newCall(req).enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (e is SocketTimeoutException) {
+                        esService.update(paymentId) {
+                            it.logProcessing(false, now(), txId, reason = "Request timeout")
+                        }
                     }
-                    resp.code in 500..599 -> Outcome.Retry
-                    else -> Outcome.Success(false)
+                    cont.resume(Outcome.Retry, null)
                 }
-            }
-        } catch (ex: Exception) {
-            if (ex is SocketTimeoutException) {
-                internalLogger.error("[$merchantAccount] timeout tx=$txId pay=$paymentId", ex)
-                esService.update(paymentId) {
-                    it.logProcessing(false, now(), txId, reason = "Request timeout")
+
+                override fun onResponse(call: Call, resp: Response) {
+                    resp.use { r ->
+                        val body = try {
+                            jsonMapper.readValue(r.body!!.charStream(), ExternalSysResponse::class.java)
+                        } catch (err: Exception) {
+                            internalLogger.error("[$merchantAccount] invalid json for payment $paymentId", err)
+                            cont.resume(Outcome.Retry, null)
+                            return
+                        }
+                        esService.update(paymentId) {
+                            it.logProcessing(body.result, now(), txId, reason = body.message)
+                        }
+                        val outcome = when {
+                            body.result          -> Outcome.Success(true)
+                            r.code == 429         -> Outcome.Retry // rate‑limit
+                            r.code in 500..599    -> Outcome.Retry // transient
+                            else                  -> Outcome.Success(false)
+                        }
+                        cont.resume(outcome, null)
+                    }
                 }
-            }
-            Outcome.Retry
+            })
         }
-
-
-    private fun noteRateLimit(resp: Response) {
-        val retryAfterMs = resp.header("Retry-After")?.toLongOrNull()?.times(1_000) ?: backoffBase
-        internalLogger.warn("[$merchantAccount] 429 received, will retry after $retryAfterMs ms")
-    }
-
-    private fun outOfTime(deadline: Long): Boolean = now() > deadline - percentile90.toMillis()
-
-    private fun backoffDelay(attempt: Int, deadline: Long): Long {
-        val delay = minOf(backoffBase * (1L shl (attempt - 1)), backoffCap)
-        return if (now() + delay < deadline) delay else -1
-    }
 
     private fun manageException(err: Exception, paymentId: UUID, txId: UUID) {
         val reason = if (err is SocketTimeoutException) "Request timeout" else err.message ?: "Unknown error"
@@ -204,7 +193,13 @@ class PaymentExternalSystemAdapterImpl(
     private fun updateMetrics(start: Long) {
         val duration = System.currentTimeMillis() - start
         latencyHistogram.recordValue(duration)
-        percentile90 = Duration.ofMillis(minOf(latencyHistogram.getValueAtPercentile(90.0), histMax))
+        p90 = Duration.ofMillis(minOf(latencyHistogram.getValueAtPercentile(90.0), histMax))
+    }
+
+    /* ----------------- DSL / utils --------------------- */
+    private sealed class Outcome<out T> {
+        data class Success<out T>(val data: T) : Outcome<T>()
+        object Retry : Outcome<Nothing>()
     }
 
     override fun price() = cfg.price
