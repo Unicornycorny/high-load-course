@@ -1,215 +1,193 @@
 package ru.quipy.payments.logic
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.ConnectionPool
-import okhttp3.Interceptor
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.Response
-import org.HdrHistogram.Histogram
+import okhttp3.*
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.TokenBucketRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter   // если пользовался раньше – можно удалить
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
-import java.time.Duration
+import java.io.IOException
 import java.util.*
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resumeWithException
+import kotlin.random.Random
+import kotlin.time.Duration.Companion.seconds
 
-private val internalLogger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
-
-class AdaptiveTimeoutInterceptor(private val timeoutProvider: () -> Long) : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val millis = timeoutProvider().toInt()
-        return chain
-            .withConnectTimeout(millis, TimeUnit.MILLISECONDS)
-            .withReadTimeout(millis, TimeUnit.MILLISECONDS)
-            .withWriteTimeout(millis, TimeUnit.MILLISECONDS)
-            .proceed(chain.request())
-    }
-}
 
 class PaymentExternalSystemAdapterImpl(
     private val cfg: PaymentAccountProperties,
-    private val esService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+    private val esService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        private val emptyBody: RequestBody = RequestBody.create(null, ByteArray(0))
-        private val jsonMapper: ObjectMapper = ObjectMapper().registerKotlinModule()
+        private val LOG = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
+        private const val TARGET_RPS = 1_000          // держим запас под лимитом 1 100 rps
+        private const val MAX_PARALLEL = 20_000       // окно in-flight по cfg.parallelRequests
+        private const val REQ_TIMEOUT_MS = 45_000L    // < processingTimeMillis (50 000)
+        private const val MAX_RETRIES = 2             // 3 попытки всего
     }
 
-    /* ---------------------------- inner DTO ---------------------------- */
-    private sealed class Outcome<out T> {
-        data class Success<out T>(val data: T) : Outcome<T>()
-        object Retry : Outcome<Nothing>()
-    }
-
-    private val serviceLabel = cfg.serviceName
-    private val merchantAccount = cfg.accountName
-    private val avgLatency = cfg.averageProcessingTime
-    private val maxRps = cfg.rateLimitPerSec
-    private val parallelism = cfg.parallelRequests
-    private val retryAttempts = 3
-
-    /* ---------------------------- runtime metrics ---------------------------- */
-    private var percentile90: Duration = Duration.ofMillis(avgLatency.toMillis() * 5)
-    private var histMax = avgLatency.toMillis() * 8
-    private val latencyHistogram = Histogram(avgLatency.toMillis(), histMax, 2)
-
-    /* ---------------------------- coroutine machinery ---------------------------- */
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val scope = CoroutineScope(Dispatchers.IO.limitedParallelism(parallelism) + SupervisorJob())
-
-    /* ---------------------------- http client ---------------------------- */
-    private val httpClient = OkHttpClient.Builder()
-        .connectionPool(ConnectionPool(18, 6, TimeUnit.MINUTES))
-        .addInterceptor(AdaptiveTimeoutInterceptor { percentile90.toMillis() })
+    /* ---------- HTTP-клиент, настроенный на большую параллель ---------- */
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .dispatcher( //Dispatcher — регулирует, сколько одновременно вызовов OkHttp может поставить в очередь.
+            Dispatcher().apply {
+                maxRequests = MAX_PARALLEL
+                maxRequestsPerHost = MAX_PARALLEL //вручную снимает штатный лимит 5/10, давая каждому соединению сколько угодно потоков
+            }
+        )
+        .connectionPool(ConnectionPool(200, 30, TimeUnit.SECONDS)) //ConnectionPool(200, 30 s) — до 200 TCP-соединений кэшируются 30 s; уменьшает hand-shake.
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(REQ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .writeTimeout(REQ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .callTimeout(REQ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
-    private val rateLimiter = TokenBucketRateLimiter(
-        rate = maxRps,
-        bucketMaxCapacity = maxRps,
-        window = avgLatency.toMillis(),
-        timeUnit = TimeUnit.MILLISECONDS,
+    /* ---------- Ограничители нагрузки ---------- */
+    private val rateLimiter = SmoothRateLimiter(TARGET_RPS) //SmoothRateLimiter — самописный «дроппер» по алгоритму leaky-bucket: ровно 1_000 пропусков/сек.
+    private val concurrencyLimiter = Semaphore(MAX_PARALLEL) //Semaphore(MAX_PARALLEL) — не позволяет запустить > 20 000 активных корутин одновременно (bulkhead pattern).
+
+    /* ---------- coroutine-scope ---------- */
+    private val scope = CoroutineScope(
+        Dispatchers.IO.limitedParallelism(2_000) + SupervisorJob()
+        //Dispatchers.IO: пул потоков, оптимизированный под I/O.
+        //.limitedParallelism(2_000) — не больше 2000 реальных потоков даже при 20 000 корутин (N ≈ 10 × CPU не рвём JVM).
+        //SupervisorJob — ошибка в одной корутине не убивает соседние.
     )
-    private val gate = Semaphore(parallelism)
 
-    private val backoffBase = 200L
-    private val backoffCap = 1_000L
+    /* ---------- API из интерфейса ---------- */
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, startedAt: Long, deadline: Long) {
+    //Захватываем Semaphore → гарантируем, что in-flight < MAX_PARALLEL.
+    //
+    //rateLimiter.acquire() ‒ может приостановить корутину ❌не поток.
+    //
+    //sendWithRetry(...) — внутри полный цикл попыток.
+    //
+    //В блок finally ресурс семафора освобождается.
+    override fun performPaymentAsync(
+        paymentId: UUID,
+        amount: Int,
+        startedAt: Long,
+        deadline: Long
+    ) {
         scope.launch {
-            internalLogger.info("[$merchantAccount] enqueue payment $paymentId")
-
-            val txId = UUID.randomUUID()
-            esService.update(paymentId) {
-                it.logSubmission(success = true, txId, now(), Duration.ofMillis(now() - startedAt))
-            }
-
-            val requestUrl = buildString {
-                append("http://localhost:1234/external/process?")
-                append("serviceName=$serviceLabel&accountName=$merchantAccount&")
-                append("transactionId=$txId&paymentId=$paymentId&amount=$amount&$percentile90")
-            }
-            val httpRequest = Request.Builder().url(requestUrl).post(emptyBody).build()
-
-            val requestStart = System.currentTimeMillis()
-
+            concurrencyLimiter.acquire()
             try {
-                gate.acquire()
-
-                var attempt = 1
-                var completedSuccessfully = false
-
-                while (attempt <= retryAttempts && !completedSuccessfully && !outOfTime(deadline)) {
-                    rateLimiter.tick()
-
-                    val outcome = withTimeoutOrNull(percentile90.toMillis()) {
-                        dispatchCall(httpRequest, paymentId, txId)
-                    }
-
-                    when (outcome) {
-                        is Outcome.Success -> {
-                            completedSuccessfully = outcome.data
-                            if (completedSuccessfully) break
-                        }
-                        is Outcome.Retry -> {
-                            val d = backoffDelay(attempt, deadline)
-                            if (d > 0) delay(d) else break
-                        }
-                        null -> break // timeout reached
-                    }
-                    attempt++
-                }
-
-                if (!completedSuccessfully) {
-                    esService.update(paymentId) {
-                        it.logProcessing(false, now(), txId, reason = "Max retries exceeded")
-                    }
-                }
-            } catch (ex: Exception) {
-                manageException(ex, paymentId, txId)
+                rateLimiter.acquire() // может приостановить корутину, но не поток
+                sendWithRetry(paymentId, amount, deadline)
             } finally {
-                updateMetrics(requestStart)
-                gate.release()
+                concurrencyLimiter.release()
             }
         }
     }
 
-    private suspend fun dispatchCall(req: Request, paymentId: UUID, txId: UUID): Outcome<Boolean> =
-        try {
-            httpClient.newCall(req).execute().use { resp ->
-                val body = try {
-                    jsonMapper.readValue(resp.body?.string(), ExternalSysResponse::class.java)
-                } catch (parseErr: Exception) {
-                    internalLogger.error("[$merchantAccount] invalid json for payment $paymentId", parseErr)
-                    return Outcome.Retry
-                }
+    override fun price(): Int = cfg.price
+    override fun isEnabled(): Boolean = cfg.enabled
+    override fun name(): String = cfg.accountName
 
-                esService.update(paymentId) {
-                    it.logProcessing(body.result, now(), txId, reason = body.message)
-                }
+    /* ---------- Внутренняя логика вызова ---------- */
 
-                when {
-                    body.result -> Outcome.Success(true)
-                    resp.code == 429 -> {
-                        noteRateLimit(resp)
-                        Outcome.Retry
+    private suspend fun sendWithRetry(paymentId: UUID, amount: Int, deadline: Long) {
+        var attempt = 0
+        val txId = UUID.randomUUID()
+
+        //Ограничение по числу попыток и абсолютному deadline (чтобы клиент не ушёл).
+        while (attempt <= MAX_RETRIES && System.currentTimeMillis() < deadline) {
+            attempt++
+            val req = buildHttpRequest(paymentId, amount, txId)
+            try {
+                val resp = httpClient.newCall(req).await()
+                when (resp.code) {
+                    in 200..299 -> {          // SUCCESS
+                        esService.update(paymentId) {
+                            it.logProcessing(true, now(), txId, reason = "HTTP ${resp.code}")
+                        }
+                        resp.close()
+                        return
                     }
-                    resp.code in 500..599 -> Outcome.Retry
-                    else -> Outcome.Success(false)
+                    in 500..599 -> {          // серверная ошибка – можно retry
+                        resp.close()
+                        delay(backoff(attempt))
+                    }
+                    429 -> {                  // превышен лимит – подождём hint или минимальный backoff
+                        val retryAfter = resp.header("Retry-After")?.toLongOrNull()?.times(1_000) ?: backoff(attempt)
+                        resp.close()
+                        delay(retryAfter)
+                    }
+                    else -> {                 // 4xx - бизнес-FAIL
+                        esService.update(paymentId) {
+                            it.logProcessing(false, now(), txId, reason = "HTTP ${resp.code}")
+                        }
+                        resp.close()
+                        return
+                    }
                 }
+            } catch (e: IOException) {
+                LOG.warn("I/O error on attempt $attempt for $paymentId : ${e.message}")
+                delay(backoff(attempt))       // сетевой глитч – retry
             }
-        } catch (ex: Exception) {
-            if (ex is SocketTimeoutException) {
-                internalLogger.error("[$merchantAccount] timeout tx=$txId pay=$paymentId", ex)
-                esService.update(paymentId) {
-                    it.logProcessing(false, now(), txId, reason = "Request timeout")
-                }
-            }
-            Outcome.Retry
         }
 
-
-    private fun noteRateLimit(resp: Response) {
-        val retryAfterMs = resp.header("Retry-After")?.toLongOrNull()?.times(1_000) ?: backoffBase
-        internalLogger.warn("[$merchantAccount] 429 received, will retry after $retryAfterMs ms")
+        // если дошли сюда – все попытки истощены
+        esService.update(paymentId) {
+            it.logProcessing(false, now(), txId, reason = "Max retries exceeded")
+        }
     }
 
-    private fun outOfTime(deadline: Long): Boolean = now() > deadline - percentile90.toMillis()
+    private fun buildHttpRequest(paymentId: UUID, amount: Int, txId: UUID): Request {
+        val url = HttpUrl.Builder()
+            .scheme("http")
+            .host("localhost")
+            .port(1234)
+            .addPathSegments("external/process")
+            .addQueryParameter("serviceName", cfg.serviceName)
+            .addQueryParameter("accountName", cfg.accountName)
+            .addQueryParameter("transactionId", txId.toString())
+            .addQueryParameter("paymentId", paymentId.toString())
+            .addQueryParameter("amount", amount.toString())
+            .build()
 
-    private fun backoffDelay(attempt: Int, deadline: Long): Long {
-        val delay = minOf(backoffBase * (1L shl (attempt - 1)), backoffCap)
-        return if (now() + delay < deadline) delay else -1
+        return Request.Builder()
+            .url(url)
+            .post(RequestBody.create(null, ByteArray(0)))
+            .build()
     }
 
-    private fun manageException(err: Exception, paymentId: UUID, txId: UUID) {
-        val reason = if (err is SocketTimeoutException) "Request timeout" else err.message ?: "Unknown error"
-        internalLogger.error("[$merchantAccount] failure tx=$txId pay=$paymentId", err)
-        esService.update(paymentId) { it.logProcessing(false, now(), txId, reason) }
+    private fun backoff(attempt: Int): Long {
+        val base = (100L shl (attempt - 1)).coerceAtMost(1_000L) // 100, 200, 400, capped 1000
+        return base + Random.nextLong(base)                      // jitter
     }
-
-    private fun updateMetrics(start: Long) {
-        val duration = System.currentTimeMillis() - start
-        latencyHistogram.recordValue(duration)
-        percentile90 = Duration.ofMillis(minOf(latencyHistogram.getValueAtPercentile(90.0), histMax))
-    }
-
-    override fun price() = cfg.price
-    override fun isEnabled() = cfg.enabled
-    override fun name() = cfg.accountName
 }
 
-fun now(): Long = System.currentTimeMillis()
+/* ---------- Утилиты ---------- */
+
+private class SmoothRateLimiter(private val permitsPerSec: Int) {
+    private val intervalNanos = 1_000_000_000L / permitsPerSec
+    private val lastTime = AtomicLong(System.nanoTime()) //AtomicLong lastTime — храним «следующее допустимое время».
+
+    suspend fun acquire() {
+        while (true) {
+            val prev = lastTime.get()
+            val now = System.nanoTime()
+            val next = maxOf(prev, now) + intervalNanos
+            if (lastTime.compareAndSet(prev, next)) {
+                val waitNs = next - now
+                if (waitNs > 0) delay(waitNs / 1_000_000) //приостанавливает корутину; поток свободен.
+                return
+            }
+        }
+    }
+}
+
+private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
+    enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) =
+            cont.resume(response) {}
+        override fun onFailure(call: Call, e: IOException) =
+            cont.resumeWithException(e)
+    })
+    cont.invokeOnCancellation { cancel() }
+}
+
+private fun now() = System.currentTimeMillis()
