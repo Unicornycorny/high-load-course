@@ -9,7 +9,6 @@ import org.slf4j.LoggerFactory
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.locks.ReentrantLock
 
 class TokenBucketRateLimiter(
     private val rate: Int,
@@ -38,6 +37,17 @@ class TokenBucketRateLimiter(
             delay(nextExpectedWakeUp - System.currentTimeMillis())
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+
+    suspend fun tryTick(timeout: Long, timeUnit: TimeUnit): Boolean {
+        val endTime = System.currentTimeMillis() + timeUnit.toMillis(timeout)
+        while (System.currentTimeMillis() < endTime) {
+            if (tick()) {
+                return true
+            }
+            delay(5)
+        }
+        return false
+    }
 
     override fun tick(): Boolean {
         while (true) {

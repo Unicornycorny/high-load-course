@@ -15,13 +15,13 @@
     <name>OnlineShop</name>
     <description>Application for resilience and highly-loaded applications course</description>
 
-	<properties>
+    <properties>
         <kotlin.version>1.9.0</kotlin.version>
         <tiny.es.version>2.7.4</tiny.es.version>
         <resilience4jVersion>2.2.0</resilience4jVersion>
     </properties>
 
-	<dependencies>
+    <dependencies>
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
@@ -124,6 +124,12 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-core</artifactId>
+            <version>9.0.85</version>
         </dependency>
     </dependencies>
 
