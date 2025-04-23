@@ -1,6 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>org.springframework.boot</groupId>
@@ -8,19 +6,16 @@
         <version>2.7.18</version>
         <relativePath/>
     </parent>
-
     <groupId>ru.quipy</groupId>
     <artifactId>demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>OnlineShop</name>
     <description>Application for resilience and highly-loaded applications course</description>
-
     <properties>
         <kotlin.version>1.9.0</kotlin.version>
         <tiny.es.version>2.7.4</tiny.es.version>
         <resilience4jVersion>2.2.0</resilience4jVersion>
     </properties>
-
     <dependencies>
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
@@ -48,32 +43,29 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.springframework.boot</groupId>
-                    <artifactId>spring-boot-starter-tomcat</artifactId>
-                </exclusion>
-            </exclusions>
+            <!--             <exclusions> -->
+            <!--                 <exclusion> -->
+            <!--                     <groupId>org.springframework.boot</groupId> -->
+            <!--                     <artifactId>spring-boot-starter-tomcat</artifactId> -->
+            <!--                 </exclusion> -->
+            <!--             </exclusions> -->
         </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-jetty</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.eclipse.jetty.http2</groupId>
-            <artifactId>http2-server</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.eclipse.jetty</groupId>
-            <artifactId>jetty-alpn-server</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>org.eclipse.jetty</groupId>
-            <artifactId>jetty-alpn-conscrypt-server</artifactId>
-        </dependency>
-
+        <!--         <dependency> -->
+        <!--             <groupId>org.springframework.boot</groupId> -->
+        <!--             <artifactId>spring-boot-starter-jetty</artifactId> -->
+        <!--         </dependency> -->
+        <!--         <dependency> -->
+        <!--             <groupId>org.eclipse.jetty.http2</groupId> -->
+        <!--             <artifactId>http2-server</artifactId> -->
+        <!--         </dependency> -->
+        <!--         <dependency> -->
+        <!--             <groupId>org.eclipse.jetty</groupId> -->
+        <!--             <artifactId>jetty-alpn-server</artifactId> -->
+        <!--         </dependency> -->
+        <!--         <dependency> -->
+        <!--             <groupId>org.eclipse.jetty</groupId> -->
+        <!--             <artifactId>jetty-alpn-conscrypt-server</artifactId> -->
+        <!--         </dependency> -->
         <dependency>
             <groupId>com.fasterxml.jackson.module</groupId>
             <artifactId>jackson-module-kotlin</artifactId>
@@ -91,13 +83,11 @@
             <groupId>org.jetbrains.kotlin</groupId>
             <artifactId>kotlin-stdlib-jdk8</artifactId>
         </dependency>
-
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-
         <dependency>
             <groupId>ru.quipy</groupId>
             <artifactId>tiny-event-sourcing-spring-boot-starter</artifactId>
@@ -109,30 +99,25 @@
                 </exclusion>
             </exclusions>
         </dependency>
-
         <dependency>
             <groupId>ru.quipy</groupId>
             <artifactId>tiny-postgres-event-store-spring-boot-starter</artifactId>
             <version>${tiny.es.version}</version>
         </dependency>
-
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
-
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
-
         <dependency>
             <groupId>org.apache.tomcat.embed</groupId>
             <artifactId>tomcat-embed-core</artifactId>
             <version>9.0.85</version>
         </dependency>
     </dependencies>
-
     <build>
         <sourceDirectory>${project.basedir}/src/main/kotlin</sourceDirectory>
         <testSourceDirectory>${project.basedir}/src/test/kotlin</testSourceDirectory>
@@ -170,5 +155,4 @@
             </plugin>
         </plugins>
     </build>
-
 </project>
